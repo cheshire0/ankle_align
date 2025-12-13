@@ -45,7 +45,16 @@ A projekt **Docker Desktop** segítségével futtatható Windows alatt is.
 
 ```powershell
 docker build -t anklealign:latest .
+
+docker run --rm `
+  -v C:\anklealign\data:/data `
+  -v C:\anklealign\output:/app/output `
+  anklealign:latest `
+  bash /app/src/run.sh
+
 ```
+
+A *run.sh* szkript egyetlen reprodukálható belépési pontot biztosít, amely szekvenciálisan végrehajtja az adatelőfeldolgozást, a modell betanítását és a végső kiértékelést.
 
 
 ## 1. Adat-előfeldolgozás

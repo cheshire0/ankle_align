@@ -4,6 +4,9 @@ scikit-learn==1.4.2
 pillow==10.3.0
 tqdm==4.66.4
 matplotlib==3.8.4
+fastapi==0.115.0
+uvicorn==0.30.6
+python-multipart==0.0.9
 
 # CPU PyTorch
 torch==2.2.2
