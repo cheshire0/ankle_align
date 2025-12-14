@@ -39,7 +39,8 @@ import pandas as pd
 from PIL import Image, UnidentifiedImageError
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-
+from utils import setup_logger
+logger = setup_logger()
 
 # Inside-container paths (DO NOT change to C:\ paths)
 RAW_ROOT = Path("/data/raw")
@@ -54,7 +55,6 @@ LABEL_MAP = {
 ID_TO_NAME = {v: k for k, v in LABEL_MAP.items()}
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-
 
 @dataclass
 class Item:
@@ -150,6 +150,9 @@ def prepare_output_dirs(clean: bool) -> None:
     if clean and PROCESSED_ROOT.exists():
         shutil.rmtree(PROCESSED_ROOT, ignore_errors=True)
     (PROCESSED_ROOT / "images").mkdir(parents=True, exist_ok=True)
+    logger.info(f"Processed dataset root: {PROCESSED_ROOT}")
+    logger.info(f"Processed images root: {PROCESSED_ROOT / 'images'}")
+    logger.info(f"Output report dir: {OUTPUT_DIR}")
 
 
 def unique_out_name(neptun: str, original_name: str) -> str:
@@ -318,6 +321,11 @@ def write_report(df: pd.DataFrame, warnings: List[str]) -> None:
 
 
 def main() -> None:
+    logger.info("Starting data preprocessing")
+    logger.info(f"Raw data directory: {RAW_ROOT}")
+    logger.info(f"Processed output directory: {PROCESSED_ROOT}")
+    logger.info(f"App output directory: {OUTPUT_DIR}")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--img-size", type=int, default=224, help="Resize images to NxN (default 224).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for splits.")
@@ -326,10 +334,22 @@ def main() -> None:
     parser.add_argument("--clean", action="store_true", help="Delete /data/processed before writing.")
     args = parser.parse_args()
 
+    logger.info("Preprocessing configuration:")
+    logger.info(f"  img_size: {args.img_size}")
+    logger.info(f"  seed: {args.seed}")
+    logger.info(f"  test_size: {args.test_size}")
+    logger.info(f"  val_size: {args.val_size}")
+    logger.info(f"  clean: {args.clean}")
+
     set_seed(args.seed)
     prepare_output_dirs(clean=args.clean)
 
     items, warnings = collect_items(RAW_ROOT)
+
+    logger.info(f"Collected labeled items (before dedup): {len(items)}")
+    if warnings:
+        logger.warning(f"Warnings so far: {len(warnings)} (see report for details)")
+
 
     if not items:
         raise RuntimeError(
@@ -356,8 +376,31 @@ def main() -> None:
     # Remove duplicates (same neptun + same filename) keeping first
     df = df.drop_duplicates(subset=["neptun", "original_name"], keep="first").reset_index(drop=True)
 
+    logger.info(f"Items after deduplication: {len(df)}")
+
+    logger.info("Label distribution (after dedup):")
+    for label, cnt in df["label_name"].value_counts().items():
+        logger.info(f"  {label}: {cnt}")
+
     # Stratified split
     df = stratified_split(df, seed=args.seed, test_size=args.test_size, val_size=args.val_size)
+
+    logger.info("Split distribution:")
+    split_counts = df["split"].value_counts().to_dict()
+    for k in ["train", "val", "test"]:
+        logger.info(f"  {k}: {split_counts.get(k, 0)}")
+
+    logger.info("Split x label distribution:")
+    pivot = pd.pivot_table(
+        df,
+        index=["split"],
+        columns=["label_name"],
+        values="original_name",
+        aggfunc="count",
+        fill_value=0,
+    )
+    for line in pivot.to_string().splitlines():
+        logger.info(line)
 
     # Process and write images
     out_records: List[dict] = []
@@ -402,11 +445,22 @@ def main() -> None:
     meta_path = PROCESSED_ROOT / "metadata.csv"
     out_df.to_csv(meta_path, index=False, encoding="utf-8")
 
+    logger.info(f"Processed images successfully: {len(out_df)}")
+    logger.info(f"Skipped/failed items during processing: {len(df) - len(out_df)}")
+
+    if warnings:
+        logger.warning(f"Total warnings: {len(warnings)}")
+        # Show first few in log (full list already saved in report)
+        for w in warnings[:20]:
+            logger.warning(w)
+        if len(warnings) > 20:
+            logger.warning(f"... warnings truncated in log ({len(warnings)-20} more; see data_report.txt)")
+
     write_report(out_df, warnings)
 
-    print(f"Done. Processed: {len(out_df)}/{len(df)}")
-    print(f"Metadata: {meta_path}")
-    print(f"Report: {OUTPUT_DIR / 'data_report.txt'}")
+    logger.info(f"Done. Processed: {len(out_df)}/{len(df)}")
+    logger.info(f"Metadata written: {meta_path}")
+    logger.info(f"Report written: {OUTPUT_DIR / 'data_report.txt'}")
 
 
 if __name__ == "__main__":

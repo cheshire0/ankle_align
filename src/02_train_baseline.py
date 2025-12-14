@@ -2,22 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-02_train_v2.py
+02_train_baseline.py  (formerly 02_train_v2.py)
 
-CPU-friendly incremental trainer:
-- GAP CNN (much fewer parameters than FC-heavy baseline)
+Baseline model trainer (reference):
+- GAP CNN (fewer parameters than FC-heavy TinyCNN)
 - NO rotation augmentation (explicitly excluded)
 - Early stopping on validation accuracy
 - Class weights in CrossEntropyLoss
+- CPU-only
 
 Input:
 - /data/processed/metadata.csv  (from 01_data_processing.py)
   Uses: split, label_id, out_path
 
 Output (/app/output):
-- model_best_v2.pt
-- train_history_v2.csv
-- train_config_v2.json
+- model_baseline.pt
+- train_history_baseline.csv
+- train_config_baseline.json
 - label_map.json (if not already there)
 """
 
@@ -37,6 +38,9 @@ from PIL import Image, ImageFile
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from utils import setup_logger
+logger = setup_logger()
+
 # Pillow can sometimes choke on truncated JPEGs; this makes it more tolerant.
 # (Does NOT rotate. Does NOT "fix" EXIF. Only affects truncated decoding.)
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -45,7 +49,6 @@ DATA_DIR = Path("/data/processed")
 META_PATH = DATA_DIR / "metadata.csv"
 OUTPUT_DIR = Path("/app/output")
 
-# Must match your pipeline mapping
 ID_TO_LABEL = {
     0: "1_Pronacio",
     1: "2_Neutralis",
@@ -86,17 +89,14 @@ def random_resized_crop_no_rotate(img: Image.Image, size: int, scale=(0.85, 1.0)
             y1 = np.random.randint(0, h - new_h + 1)
             cropped = img.crop((x1, y1, x1 + new_w, y1 + new_h))
             return cropped.resize((size, size))
-    # fallback to center crop-ish
     return img.resize((size, size))
 
 
 def color_jitter(img: Image.Image, brightness=0.15, contrast=0.15) -> Image.Image:
     """Simple brightness/contrast jitter (NO rotation)."""
-    # brightness
     if brightness > 0:
         b = np.random.uniform(1 - brightness, 1 + brightness)
         img = Image.fromarray(np.clip(np.asarray(img, np.float32) * b, 0, 255).astype(np.uint8))
-    # contrast
     if contrast > 0:
         c = np.random.uniform(1 - contrast, 1 + contrast)
         arr = np.asarray(img, np.float32)
@@ -113,7 +113,6 @@ def random_translate_no_rotate(img: Image.Image, max_frac: float = 0.06) -> Imag
     max_dy = int(round(h * max_frac))
     dx = np.random.randint(-max_dx, max_dx + 1)
     dy = np.random.randint(-max_dy, max_dy + 1)
-    # Paste onto black canvas
     canvas = Image.new("RGB", (w, h), (0, 0, 0))
     canvas.paste(img, (dx, dy))
     return canvas
@@ -225,8 +224,7 @@ def compute_class_weights(train_df: pd.DataFrame) -> torch.Tensor:
     for k in range(3):
         w.append(1.0 / max(int(counts.get(k, 1)), 1))
     w = torch.tensor(w, dtype=torch.float32)
-    # normalize to mean weight = 1
-    w = w / w.mean()
+    w = w / w.mean()  # normalize mean=1
     return w
 
 
@@ -242,6 +240,19 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=8, help="Early stopping patience (val acc).")
     args = parser.parse_args()
 
+    logger.info("Starting BASELINE training (GAPCNN, no-rotation aug, class weights, early stopping)")
+    logger.info("Baseline configuration:")
+    logger.info(f"  img_size: {args.img_size}")
+    logger.info(f"  batch_size: {args.batch_size}")
+    logger.info(f"  epochs: {args.epochs}")
+    logger.info(f"  lr: {args.lr}")
+    logger.info(f"  weight_decay: {args.weight_decay}")
+    logger.info(f"  seed: {args.seed}")
+    logger.info(f"  num_workers: {args.num_workers}")
+    logger.info(f"  patience: {args.patience}")
+    logger.info(f"Metadata path: {META_PATH}")
+    logger.info(f"Output dir: {OUTPUT_DIR}")
+
     set_seed(args.seed)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -249,10 +260,15 @@ def main() -> None:
         raise FileNotFoundError(f"Missing metadata: {META_PATH}. Run 01_data_processing.py first.")
 
     df = pd.read_csv(META_PATH)
+    logger.info(f"Loaded metadata rows: {len(df)}")
 
-    # Keep only processed items that exist
     df = df[df["out_path"].notna()].copy()
     df = df[df["out_path"].apply(lambda p: isinstance(p, str) and Path(p).exists())].copy()
+
+    logger.info(f"Rows with existing processed images: {len(df)}")
+    logger.info("Split sizes:")
+    for split_name, cnt in df["split"].value_counts().items():
+        logger.info(f"  {split_name}: {cnt}")
 
     train_df = df[df["split"] == "train"].copy()
     val_df = df[df["split"] == "val"].copy()
@@ -260,7 +276,15 @@ def main() -> None:
     if len(train_df) == 0 or len(val_df) == 0:
         raise RuntimeError("Train/val split is empty. Check metadata.csv and processed images.")
 
+    logger.info(f"Train samples: {len(train_df)}")
+    logger.info(f"Val samples: {len(val_df)}")
+
+    logger.info("Train label distribution:")
+    for label, cnt in train_df["label_id"].value_counts().sort_index().items():
+        logger.info(f"  {ID_TO_LABEL.get(int(label), str(label))}: {cnt}")
+
     device = torch.device("cpu")
+    logger.info(f"Device: {device}")
 
     train_ds = AnkleDataset(train_df, img_size=args.img_size, train=True)
     val_ds = AnkleDataset(val_df, img_size=args.img_size, train=False)
@@ -270,9 +294,17 @@ def main() -> None:
 
     model = GAPCNN(num_classes=3).to(device)
 
-    class_w = compute_class_weights(train_df).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_w)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info("Model: GAPCNN (Baseline)")
+    logger.info(f"Total parameters: {total_params}")
+    logger.info(f"Trainable parameters: {trainable_params}")
 
+    class_w = compute_class_weights(train_df).to(device)
+    logger.info("Class weights (normalized, order = [Pronacio, Neutralis, Szupinacio]):")
+    logger.info(f"  {class_w.detach().cpu().tolist()}")
+
+    criterion = nn.CrossEntropyLoss(weight=class_w)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_val_acc = -1.0
@@ -280,13 +312,15 @@ def main() -> None:
     bad_epochs = 0
     history = []
 
+    ckpt_path = OUTPUT_DIR / "model_baseline.pt"
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         run_loss = 0.0
         run_acc = 0.0
         n = 0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
+        pbar = tqdm(train_loader, desc=f"Baseline Epoch {epoch}/{args.epochs}", leave=False)
         for xb, yb in pbar:
             xb, yb = xb.to(device), yb.to(device)
 
@@ -305,55 +339,65 @@ def main() -> None:
         train_metrics = {"loss": run_loss / max(n, 1), "acc": run_acc / max(n, 1)}
         val_metrics = evaluate(model, val_loader, device, criterion)
 
-        row = {
-            "epoch": epoch,
-            "train_loss": train_metrics["loss"],
-            "train_acc": train_metrics["acc"],
-            "val_loss": val_metrics["loss"],
-            "val_acc": val_metrics["acc"],
-        }
-        history.append(row)
-
-        print(
-            f"Epoch {epoch:02d} | "
-            f"train loss {train_metrics['loss']:.4f} acc {train_metrics['acc']:.4f} | "
-            f"val loss {val_metrics['loss']:.4f} acc {val_metrics['acc']:.4f}"
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_metrics["loss"],
+                "train_acc": train_metrics["acc"],
+                "val_loss": val_metrics["loss"],
+                "val_acc": val_metrics["acc"],
+            }
         )
 
-        # Early stopping on val acc
+        logger.info(
+            f"Baseline Epoch {epoch:02d}/{args.epochs} | "
+            f"train_loss={train_metrics['loss']:.4f} train_acc={train_metrics['acc']:.4f} | "
+            f"val_loss={val_metrics['loss']:.4f} val_acc={val_metrics['acc']:.4f}"
+        )
+
         if val_metrics["acc"] > best_val_acc + 1e-6:
             best_val_acc = val_metrics["acc"]
             best_epoch = epoch
             bad_epochs = 0
+            logger.info(f"New best BASELINE val_acc={best_val_acc:.4f} at epoch {epoch}. Saving checkpoint.")
             torch.save(
                 {
                     "model_state": model.state_dict(),
                     "img_size": args.img_size,
                     "id_to_label": ID_TO_LABEL,
                     "class_weights": class_w.detach().cpu().tolist(),
+                    "model_name": "GAPCNNBaseline",
                 },
-                OUTPUT_DIR / "model_best_v2.pt",
+                ckpt_path,
             )
         else:
             bad_epochs += 1
 
         if bad_epochs >= args.patience:
-            print(f"Early stopping: no val acc improvement for {args.patience} epochs. Best epoch: {best_epoch}")
+            logger.info(
+                f"Early stopping triggered: no val_acc improvement for {args.patience} epochs. "
+                f"Best epoch: {best_epoch} (best val_acc={best_val_acc:.4f})"
+            )
             break
 
-    pd.DataFrame(history).to_csv(OUTPUT_DIR / "train_history_v2.csv", index=False)
+    hist_path = OUTPUT_DIR / "train_history_baseline.csv"
+    cfg_path = OUTPUT_DIR / "train_config_baseline.json"
 
-    with open(OUTPUT_DIR / "train_config_v2.json", "w", encoding="utf-8") as f:
+    pd.DataFrame(history).to_csv(hist_path, index=False)
+
+    with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2)
 
-    # Keep label_map.json consistent
     label_map_path = OUTPUT_DIR / "label_map.json"
     if not label_map_path.exists():
         with open(label_map_path, "w", encoding="utf-8") as f:
             json.dump({str(k): v for k, v in ID_TO_LABEL.items()}, f, indent=2)
 
-    print(f"Done. Best val acc: {best_val_acc:.4f} at epoch {best_epoch}")
-    print(f"Saved: {OUTPUT_DIR / 'model_best_v2.pt'}")
+    logger.info(f"BASELINE training finished. Best val_acc={best_val_acc:.4f} at epoch {best_epoch}")
+    logger.info(f"Saved checkpoint: {ckpt_path}")
+    logger.info(f"Saved history: {hist_path}")
+    logger.info(f"Saved config: {cfg_path}")
+    logger.info(f"Saved label map: {label_map_path}")
 
 
 if __name__ == "__main__":

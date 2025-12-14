@@ -1,0 +1,10 @@
+# Training configuration
+EPOCHS = 80
+BATCH_SIZE = 16
+LEARNING_RATE = 1e-3
+PATIENCE = 10
+
+# Data
+IMG_SIZE = 224
+NUM_CLASSES = 3
+SEED = 42
